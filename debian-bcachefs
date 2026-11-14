@@ -1,0 +1,186 @@
+#!/bin/sh
+
+case "$1" in
+    forky)
+        SUITE="$1"
+        ;;
+    *)
+        echo "$0: Missing/incorrect suite provided." 1>&2
+        exit 1
+        ;;
+esac
+
+IMG="debian-$SUITE-bcachefs.img"
+MNT="/mnt/debian-$SUITE-bcachefs"
+
+FSOPTIONS='noatime'
+
+if [ -e "$IMG" ]; then
+	echo "$0: $IMG already exists" 1>&2
+	exit 1
+fi
+
+# Ensure image mountpoint exists
+mkdir -p "$MNT" || exit 1
+
+# Create 3GB image file
+fallocate --length 3G "$IMG" || exit 1
+
+# Create loop device for the image
+LOOPDEV="$(losetup --find --partscan --show "$IMG")" || exit 1
+
+# Create GPT partition table with appropriate partitions
+sfdisk --quiet "$LOOPDEV" <<TABLE || exit 1
+label: gpt
+unit: sectors
+first-lba: 2048
+last-lba: 6291422
+sector-size: 512
+
+${LOOPDEV}p1 : start=        2048, size=        2048, type=21686148-6449-6E6F-744E-656564454649
+${LOOPDEV}p2 : start=        4096, size=     1048576, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4
+${LOOPDEV}p3 : start=     1052672, size=     5238751, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4
+TABLE
+
+BOOTDEV="${LOOPDEV}p2"
+ROOTDEV="${LOOPDEV}p3"
+
+# Create /boot and / filesystems
+mkfs.ext4 -q "$BOOTDEV" || exit 1
+mkfs.bcachefs --quiet --metadata_checksum=xxhash --data_checksum=xxhash --replicas=1 --acl "$ROOTDEV" || exit 1
+
+# Obtain filesystem UUIDs for the image's fstab
+BOOTUUID="$(blkid --match-tag UUID --output value "$BOOTDEV")" || exit 1
+ROOTUUID="$(blkid --match-tag UUID --output value "$ROOTDEV")" || exit 1
+
+# Mount the filesystem
+mount "$ROOTDEV" "$MNT" -o "$FSOPTIONS" || exit 1
+
+# Create /boot mountpoint and mount /boot on it
+mkdir "$MNT/boot" || exit 1
+mount "$BOOTDEV" "$MNT/boot" || exit 1
+
+# Bootstrap debian into the image
+debootstrap "$SUITE" "$MNT" || exit 1
+
+# Build fstab
+cat >"$MNT/etc/fstab" <<FSTAB || exit 1
+UUID=$ROOTUUID	/	bcachefs	$FSOPTIONS	0	1
+UUID=$BOOTUUID	/boot	ext4	defaults	0	0
+FSTAB
+
+export MNT SUITE FSOPTIONS LOOPDEV
+
+unshare --mount --propagation private -- \
+    sh -ceu '
+# Bind-mount virtual filesystems (required for grub install)
+for i in dev proc sys run; do
+	mount --rbind /$i "$MNT/$i" || exit 1
+done || exit 1
+
+# Set up apt sources and install available upgrades.
+cat >"$MNT/etc/apt/sources.list" <<APT || exit 1
+deb http://deb.debian.org/debian $SUITE main
+deb http://security.debian.org/debian-security $SUITE-security main
+deb http://deb.debian.org/debian $SUITE-updates main
+APT
+
+chroot "$MNT" apt-get update || exit 1
+chroot "$MNT" apt-get full-upgrade --yes || exit 1
+chroot "$MNT" apt-get install --yes ca-certificates locales grub-pc linux-image-amd64 cloud-init || exit 1
+
+install -d -m 0755 "$MNT/etc/apt/keyrings" || exit 1
+wget -q -O "$MNT/etc/apt/keyrings/apt.bcachefs.org.asc" https://apt.bcachefs.org/apt.bcachefs.org.asc || exit 1
+chmod 0644 "$MNT/etc/apt/keyrings/apt.bcachefs.org.asc" || exit 1
+
+cat >"$MNT/etc/apt/sources.list.d/apt.bcachefs.org.sources" <<SOURCES || exit 1
+Types: deb deb-src
+URIs: https://apt.bcachefs.org/$SUITE/
+Suites: bcachefs-tools-release
+Components: main
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/apt.bcachefs.org.asc
+SOURCES
+
+chroot "$MNT" apt-get update || exit 1
+
+# Install additional packages into the image system
+chroot "$MNT" apt-get install --yes bcachefs-tools bcachefs-kernel-dkms || exit 1
+
+# Configure grub for bcachefs and Linode.
+#
+# For scsi_mod.scan=sync, see
+# https://www.linode.com/community/questions/22853/grub-errors-on-new-server-not-loading-disk-debian-11
+cat >>"$MNT/etc/default/grub" <<GRUB || exit 1
+GRUB_CMDLINE_LINUX="console=ttyS0,19200n8 net.ifnames=0 scsi_mod.scan=sync rootflags=$FSOPTIONS"
+
+# Enable serial console for LISH
+GRUB_GFXPAYLOAD_LINUX=text
+GRUB_TERMINAL=serial
+GRUB_SERIAL_COMMAND="serial --speed=19200 --unit=0 --word=8 --parity=no --stop=1"
+GRUB
+
+# initramfs-tools cannot figure out that we need this kernel module in the
+# initrd to support the xxhash checksum algorithm, so force it to include the
+# module
+#echo xxhash_generic >>"$MNT/etc/initramfs-tools/modules" || exit 1
+
+# Update initrd and install grub
+chroot "$MNT" update-initramfs -k all -u || exit 1
+chroot "$MNT" grub-install "$LOOPDEV" || exit 1
+chroot "$MNT" update-grub || exit 1
+
+# Set root password
+echo "root:root" | chroot "$MNT" chpasswd || exit 1
+
+# Empty /etc/resolv.conf, which is copied from the host by debootstrap
+truncate -s 0 "$MNT/etc/resolv.conf" || exit 1
+
+# Hostname is also copied from the host
+echo "debian-$SUITE-bcachefs" >"$MNT/etc/hostname" || exit 1
+
+# Install default network config for Linode
+for iface in eth0 eth1 eth2; do
+	cat >>"$MNT/etc/network/interfaces.d/$iface.conf" <<IFACE || exit 1
+allow-hotplug $iface
+iface $iface inet dhcp
+IFACE
+done || exit 1
+
+# Linode cloud-config
+cat >"$MNT/etc/cloud/cloud.cfg.d/99-linode.cfg" <<CLOUD || exit 1
+# Linode cloud-init overrides
+
+# Configure datasources.
+datasource_list: [ NoCloud, ConfigDrive, None ]
+
+# Do not perform any network configuration.
+network: { config: disabled }
+
+# Enable root logins.
+disable_root: false
+
+# Configure ssh
+ssh_pwauth: unchanged
+
+# Preserve the apt sources.list.
+apt_preserve_sources_list: true
+
+# Do not include a default user.
+system_info:
+  default_user:
+CLOUD
+'
+
+# Flush filesystem caches and trim /boot punch holes in our image file.
+# Bcachefs trims automatically.
+sync "$MNT/boot" && fstrim "$MNT/boot" || exit 1
+
+# Unmount filesystems
+umount "$MNT/boot" || exit 1
+umount "$MNT" || exit 1
+
+# Remove loop device
+losetup --detach "$LOOPDEV" || exit 1
+
+gzip "$IMG" || exit 1
